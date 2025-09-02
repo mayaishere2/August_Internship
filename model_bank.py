@@ -13,49 +13,75 @@ import pickle
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Set
+# --- at the top of model_bank.py (after other imports)
+import os, pickle, requests
 
-# Adjust if your files live somewhere else
-MODEL_DIR = "models"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(APP_DIR, "models")
 REGISTRY_PATH = "model_registry.json"
 
-# -----------------------------
-# Registry / model IO
-# -----------------------------
-def _read_registry_lines(path: str) -> List[dict]:
-    """Read newline-delimited JSON registry -> list of entries."""
-    entries = []
-    if not os.path.exists(path):
-        return entries
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-                # normalize keys
-                if isinstance(obj, dict) and "features" in obj and "model_name" in obj:
-                    # Uppercase canon for matching
-                    obj["features"] = [str(x).upper() for x in obj.get("features", [])]
-                    entries.append(obj)
-            except Exception:
-                continue
-    return entries
+MODELS_BASE_URL = os.environ.get("MODELS_BASE_URL")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+try:
+    import streamlit as st  # will exist in prod
+    if MODELS_BASE_URL is None:
+        MODELS_BASE_URL = st.secrets.get("MODELS_BASE_URL", None)
+    if HF_TOKEN is None:
+        HF_TOKEN = st.secrets.get("HF_TOKEN", None)
+except Exception:
+    pass
 
-def load_registry() -> dict:
-    """
-    Loads your line-by-line registry into a dict {"models": [...]}.
-    Each item minimally has: model_name, features[], metrics{f1_macro?}.
-    """
-    return {"models": _read_registry_lines(REGISTRY_PATH)}
+def _download(url: str, out_path: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+    with requests.get(url, stream=True, timeout=120, headers=headers) as r:
+        r.raise_for_status()
+        tmp = out_path + ".part"
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                if chunk:
+                    f.write(chunk)
+        os.replace(tmp, out_path)
+
+def _remote_urls(model_name: str):
+    base = MODELS_BASE_URL.rstrip("/") if MODELS_BASE_URL else ""
+    return [f"{base}/{model_name}.pkl", f"{base}/{model_name}.joblib"]
 
 def load_model(model_name: str):
-    """Loads a pickled sklearn model from models/."""
-    model_path = os.path.join(MODEL_DIR, f"{model_name}.pkl")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Trained model file not found: {model_path}")
-    with open(model_path, "rb") as f:
-        return pickle.load(f)
+    """Load from disk; if missing and MODELS_BASE_URL is set, download and cache."""
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    local_pkl = os.path.join(MODEL_DIR, f"{model_name}.pkl")
+    local_jl  = os.path.join(MODEL_DIR, f"{model_name}.joblib")
+
+    # 1) cached on disk?
+    if os.path.exists(local_pkl):
+        with open(local_pkl, "rb") as f:
+            return pickle.load(f)
+    if os.path.exists(local_jl):
+        import joblib
+        return joblib.load(local_jl)
+
+    # 2) download on demand
+    if MODELS_BASE_URL:
+        last_err = None
+        for url in _remote_urls(model_name):
+            try:
+                out = local_pkl if url.endswith(".pkl") else local_jl
+                _download(url, out)
+                if out.endswith(".pkl"):
+                    with open(out, "rb") as f:
+                        return pickle.load(f)
+                else:
+                    import joblib
+                    return joblib.load(out)
+            except Exception as e:
+                last_err = e
+                continue
+        raise FileNotFoundError(f"Tried to download {model_name} as .pkl/.joblib but failed. "
+                                f"Check MODELS_BASE_URL and that the file exists remotely. Last error: {last_err}")
+
+    # 3) no base URL provided
+    raise FileNotFoundError(f"Trained model file not found locally and no MODELS_BASE_URL set: {model_name}")
 
 # -----------------------------
 # Canonical feature families
