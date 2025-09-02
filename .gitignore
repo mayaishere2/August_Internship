@@ -1,0 +1,11 @@
+# ignore big model artifacts
+models/
+models_joblib/
+*.pkl
+*.joblib
+
+# typical extras
+.venv/
+__pycache__/
+.DS_Store
+.streamlit/secrets.toml
