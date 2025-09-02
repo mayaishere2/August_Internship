@@ -7,3 +7,5 @@ pmdarima
 lightgbm
 matplotlib
 plotly
+requests
+joblib
