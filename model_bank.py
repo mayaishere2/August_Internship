@@ -18,7 +18,7 @@ import os, pickle, requests
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "models")
-REGISTRY_PATH = "model_registry.json"
+REGISTRY_PATH = os.path.join(APP_DIR, "model_registry.json")
 
 MODELS_BASE_URL = os.environ.get("MODELS_BASE_URL")
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -46,6 +46,60 @@ def _download(url: str, out_path: str):
 def _remote_urls(model_name: str):
     base = MODELS_BASE_URL.rstrip("/") if MODELS_BASE_URL else ""
     return [f"{base}/{model_name}.pkl", f"{base}/{model_name}.joblib"]
+# --- Registry helpers (add these) ---
+def _read_registry_lines(path: str):
+    """Read newline-delimited JSON (one model per line)."""
+    items = []
+    if not os.path.exists(path):
+        return items
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    # normalize feature names to UPPER for matching
+                    feats = [str(x).upper() for x in obj.get("features", [])]
+                    obj["features"] = feats
+                    items.append(obj)
+            except Exception:
+                continue
+    return items
+
+def load_registry() -> dict:
+    """
+    Returns {"models": [...]} from model_registry.json.
+    Supports:
+      - newline-delimited JSON (one object per line)
+      - a JSON list
+      - a JSON dict with "models"
+    """
+    path = REGISTRY_PATH
+    if not os.path.exists(path):
+        return {"models": []}
+
+    # Try full-file JSON first
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "models" in data:
+            # normalize features to UPPER
+            for e in data["models"]:
+                if isinstance(e, dict):
+                    e["features"] = [str(x).upper() for x in e.get("features", [])]
+            return data
+        if isinstance(data, list):
+            for e in data:
+                if isinstance(e, dict):
+                    e["features"] = [str(x).upper() for x in e.get("features", [])]
+            return {"models": data}
+    except Exception:
+        pass
+
+    # Fallback: line-by-line registry
+    return {"models": _read_registry_lines(path)}
 
 def load_model(model_name: str):
     """Load from disk; if missing and MODELS_BASE_URL is set, download and cache."""
