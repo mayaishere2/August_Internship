@@ -14,26 +14,33 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Set
 # --- at the top of model_bank.py (after other imports)
-import os, pickle, requests
+# ---- put near the top (after other imports) ----
+import os, pickle, requests, joblib
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "models")
 REGISTRY_PATH = os.path.join(APP_DIR, "model_registry.json")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-MODELS_BASE_URL = os.environ.get("MODELS_BASE_URL")
-HF_TOKEN = os.environ.get("HF_TOKEN")
-try:
-    import streamlit as st  # will exist in prod
-    if MODELS_BASE_URL is None:
-        MODELS_BASE_URL = st.secrets.get("MODELS_BASE_URL", None)
-    if HF_TOKEN is None:
-        HF_TOKEN = st.secrets.get("HF_TOKEN", None)
-except Exception:
-    pass
+def _get_secrets():
+    """Fetch MODELS_BASE_URL/HF_TOKEN at call-time (works on Streamlit Cloud)."""
+    base  = os.environ.get("MODELS_BASE_URL") or ""
+    token = os.environ.get("HF_TOKEN") or ""
+    try:
+        import streamlit as st
+        base  = base  or st.secrets.get("MODELS_BASE_URL", "")
+        token = token or st.secrets.get("HF_TOKEN", "")
+    except Exception:
+        pass
+    return base.strip(), token.strip()
 
-def _download(url: str, out_path: str):
+def _remote_urls(model_name: str, base_url: str):
+    base = base_url.rstrip("/")
+    return [f"{base}/{model_name}.pkl", f"{base}/{model_name}.joblib"]
+
+def _download(url: str, out_path: str, token: str = ""):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     with requests.get(url, stream=True, timeout=120, headers=headers) as r:
         r.raise_for_status()
         tmp = out_path + ".part"
@@ -43,9 +50,38 @@ def _download(url: str, out_path: str):
                     f.write(chunk)
         os.replace(tmp, out_path)
 
-def _remote_urls(model_name: str):
-    base = MODELS_BASE_URL.rstrip("/") if MODELS_BASE_URL else ""
-    return [f"{base}/{model_name}.pkl", f"{base}/{model_name}.joblib"]
+def load_model(model_name: str):
+    """Load from ./models; if missing, download from MODELS_BASE_URL and cache."""
+    local_pkl = os.path.join(MODEL_DIR, f"{model_name}.pkl")
+    local_jl  = os.path.join(MODEL_DIR, f"{model_name}.joblib")
+
+    # 1) local cache first
+    if os.path.exists(local_pkl):
+        with open(local_pkl, "rb") as f:
+            return pickle.load(f)
+    if os.path.exists(local_jl):
+        return joblib.load(local_jl)
+
+    # 2) remote fetch (call-time secrets)
+    base_url, token = _get_secrets()
+    if base_url:
+        last_err = None
+        for url in _remote_urls(model_name, base_url):
+            try:
+                out = local_pkl if url.endswith(".pkl") else local_jl
+                _download(url, out, token)
+                return pickle.load(open(out, "rb")) if out.endswith(".pkl") else joblib.load(out)
+            except Exception as e:
+                last_err = e
+                continue
+        raise FileNotFoundError(
+            f"Tried to download {model_name} (.pkl/.joblib) but failed. "
+            f"Check MODELS_BASE_URL and that the file exists remotely. Last error: {last_err}"
+        )
+
+    # 3) no base URL available
+    raise FileNotFoundError(f"Trained model file not found locally and no MODELS_BASE_URL set: {model_name}")
+
 # --- Registry helpers (add these) ---
 def _read_registry_lines(path: str):
     """Read newline-delimited JSON (one model per line)."""
@@ -100,42 +136,6 @@ def load_registry() -> dict:
 
     # Fallback: line-by-line registry
     return {"models": _read_registry_lines(path)}
-
-def load_model(model_name: str):
-    """Load from disk; if missing and MODELS_BASE_URL is set, download and cache."""
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    local_pkl = os.path.join(MODEL_DIR, f"{model_name}.pkl")
-    local_jl  = os.path.join(MODEL_DIR, f"{model_name}.joblib")
-
-    # 1) cached on disk?
-    if os.path.exists(local_pkl):
-        with open(local_pkl, "rb") as f:
-            return pickle.load(f)
-    if os.path.exists(local_jl):
-        import joblib
-        return joblib.load(local_jl)
-
-    # 2) download on demand
-    if MODELS_BASE_URL:
-        last_err = None
-        for url in _remote_urls(model_name):
-            try:
-                out = local_pkl if url.endswith(".pkl") else local_jl
-                _download(url, out)
-                if out.endswith(".pkl"):
-                    with open(out, "rb") as f:
-                        return pickle.load(f)
-                else:
-                    import joblib
-                    return joblib.load(out)
-            except Exception as e:
-                last_err = e
-                continue
-        raise FileNotFoundError(f"Tried to download {model_name} as .pkl/.joblib but failed. "
-                                f"Check MODELS_BASE_URL and that the file exists remotely. Last error: {last_err}")
-
-    # 3) no base URL provided
-    raise FileNotFoundError(f"Trained model file not found locally and no MODELS_BASE_URL set: {model_name}")
 
 # -----------------------------
 # Canonical feature families
